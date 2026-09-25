@@ -10,7 +10,7 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from psycopg.rows import dict_row
 
-from rules import judge
+from rules import fmt_hhmm, in_curfew, judge, parse_hhmm
 
 SECRET = os.environ.get("JWT_SECRET", "herb-process-dev-secret")
 DSN = os.environ.get("DATABASE_URL", "postgresql://app:app@localhost:54393/herb")
@@ -42,6 +42,11 @@ class BatchIn(BaseModel):
     steps: list[StepIn]
 
 
+class CurfewIn(BaseModel):
+    start: str
+    end: str
+
+
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
     if credentials is None:
         raise HTTPException(status_code=401, detail="未登录")
@@ -58,6 +63,25 @@ def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
         raise HTTPException(status_code=403, detail="仅炮制员可写入记录")
     return user
+
+
+def load_curfew(conn) -> dict:
+    return conn.execute(
+        "SELECT id, start_min, end_min, updated_by, updated_at FROM curfew_config WHERE id = 1"
+    ).fetchone()
+
+
+def curfew_state(row: dict) -> dict:
+    now = datetime.now()  # 服务器本地时钟，禁写判定以此为准
+    now_min = now.hour * 60 + now.minute
+    return {
+        "start": fmt_hhmm(row["start_min"]),
+        "end": fmt_hhmm(row["end_min"]),
+        "in_curfew": in_curfew(row["start_min"], row["end_min"], now_min),
+        "server_time": now.strftime("%H:%M:%S"),
+        "updated_by": row["updated_by"],
+        "updated_at": row["updated_at"],
+    }
 
 
 app = FastAPI(title="饮片炮制记录台")
@@ -77,6 +101,31 @@ def startup():
                 created_at timestamptz NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS curfew_config (
+                id integer PRIMARY KEY,
+                start_min integer NOT NULL,
+                end_min integer NOT NULL,
+                updated_by text NOT NULL,
+                updated_at timestamptz NOT NULL
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS curfew_hits (
+                id serial PRIMARY KEY,
+                herb text NOT NULL,
+                attempted_by text NOT NULL,
+                attempted_at timestamptz NOT NULL,
+                window_start text NOT NULL,
+                window_end text NOT NULL
+            )"""
+        )
+        if conn.execute("SELECT COUNT(*) AS n FROM curfew_config").fetchone()["n"] == 0:
+            conn.execute(
+                """INSERT INTO curfew_config (id, start_min, end_min, updated_by, updated_at)
+                   VALUES (1, %s, %s, %s, %s)""",
+                (22 * 60, 6 * 60, "system", datetime.now(timezone.utc)),
+            )
         count = conn.execute("SELECT COUNT(*) AS n FROM batches").fetchone()["n"]
         if count == 0:
             now = datetime.now(timezone.utc)
@@ -116,16 +165,69 @@ def list_batches(_user: dict = Depends(current_user)):
     return rows
 
 
+@app.get("/api/curfew")
+def get_curfew(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return curfew_state(load_curfew(conn))
+
+
+@app.put("/api/curfew")
+def put_curfew(body: CurfewIn, user: dict = Depends(require_writer)):
+    try:
+        start_min = parse_hhmm(body.start)
+        end_min = parse_hhmm(body.end)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    with connect() as conn:
+        conn.execute(
+            """UPDATE curfew_config
+               SET start_min = %s, end_min = %s, updated_by = %s, updated_at = %s
+               WHERE id = 1""",
+            (start_min, end_min, user["username"], datetime.now(timezone.utc)),
+        )
+        conn.commit()
+        return curfew_state(load_curfew(conn))
+
+
+@app.get("/api/curfew/hits")
+def list_curfew_hits(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            """SELECT id, herb, attempted_by, attempted_at, window_start, window_end
+               FROM curfew_hits ORDER BY id DESC"""
+        ).fetchall()
+
+
 @app.post("/api/batches", status_code=201)
 def create_batch(body: BatchIn, user: dict = Depends(require_writer)):
     doc = {"steps": [s.model_dump() for s in body.steps]}
     verdict, reason = judge(doc)
+    herb = body.herb.strip()
     with connect() as conn:
+        curfew = load_curfew(conn)
+        now = datetime.now()  # 服务器本地时钟
+        if in_curfew(curfew["start_min"], curfew["end_min"], now.hour * 60 + now.minute):
+            conn.execute(
+                """INSERT INTO curfew_hits (herb, attempted_by, attempted_at, window_start, window_end)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (
+                    herb,
+                    user["username"],
+                    datetime.now(timezone.utc),
+                    fmt_hhmm(curfew["start_min"]),
+                    fmt_hhmm(curfew["end_min"]),
+                ),
+            )
+            conn.commit()
+            raise HTTPException(
+                status_code=403,
+                detail=f"当前处于夜间禁写窗（{fmt_hhmm(curfew['start_min'])}–{fmt_hhmm(curfew['end_min'])}），禁止开炒写入",
+            )
         row = conn.execute(
             """INSERT INTO batches (herb, doc, verdict, reason, created_by, created_at)
                VALUES (%s, %s::jsonb, %s, %s, %s, %s)
                RETURNING id, herb, doc, verdict, reason, created_by""",
-            (body.herb.strip(), json.dumps(doc, ensure_ascii=False), verdict, reason, user["username"], datetime.now(timezone.utc)),
+            (herb, json.dumps(doc, ensure_ascii=False), verdict, reason, user["username"], datetime.now(timezone.utc)),
         ).fetchone()
         conn.commit()
     return row
